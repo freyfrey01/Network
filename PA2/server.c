@@ -12,11 +12,42 @@
 #include <pthread.h>
 #include <errno.h>
 #include <ctype.h>
+#include <stdbool.h>
 #define BUFSIZE 8192
 #define SMALLBUF 1024
 #define connections 1024
 
 int MAINsockfd; /* socket */
+bool keepRunning=true;
+//https://stackoverflow.com/questions/3536153/c-dynamically-growing-array
+typedef struct {
+  pthread_t *array;
+  size_t used;
+  size_t size;
+} Vector;
+
+void initArray(Vector *a, size_t initialSize) {
+  a->array = malloc(initialSize * sizeof(pthread_t));
+  a->used = 0;
+  a->size = initialSize;
+}
+
+void insertArray(Vector *a, pthread_t element) {
+  // a->used is the number of used entries, because a->array[a->used++] updates a->used only *after* the array has been accessed.
+  // Therefore a->used can go up to a->size 
+  if (a->used == a->size) {
+    a->size *= 2;
+    a->array = realloc(a->array, a->size * sizeof(pthread_t));
+  }
+  a->array[a->used++] = element;
+}
+
+void freeArray(Vector *a) {
+  free(a->array);
+  a->array = NULL;
+  a->used = a->size = 0;
+}
+
 void error(char *msg) {
   perror(msg);
   exit(1);
@@ -175,13 +206,14 @@ void NotFound(int sockfd,char* version,char *connection)
 void sigHandler()
 {
     printf("\nWaiting for threads.\n");
+    keepRunning = false;
     close(MAINsockfd);
 }
 
 void* connection(void * connectionInfo)
 {
     int sockfd = *(int *)connectionInfo; //gets socked fd
-    pthread_detach(pthread_self()); //
+    //pthread_detach(pthread_self()); //
     //thread routine starts here
     int n;
     char buf[BUFSIZE];
@@ -192,6 +224,8 @@ void* connection(void * connectionInfo)
         error("ERROR setting receive socket timeout");
     while((n = recv(sockfd,buf,BUFSIZE,0)) > 0) //ensure socket is open and timeout hasnt been reached
     {
+        bool keepAlive = true;
+        //sleep(5);
         //printf("\nServer received the following request:\n%s",buf);
         char temp[BUFSIZE];
         bzero(temp, BUFSIZE);
@@ -227,30 +261,10 @@ void* connection(void * connectionInfo)
         {
             BadRequest(sockfd,version,connection);
             if(strcmp(version,"HTTP/1.1")==0)
-            {//http/1.1
-                if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
-                {}
-                else if(strcmp(connection,"connection:close")==0) //close socket
-                {
-                    break;
-                }
-                else
-                {
-                    break;
-                }
-            }
+            {}
             else
             {//http/1.0
-                if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
-                {
-                    break;
-                }
-                else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                {}
-                else
-                {
-                    break;
-                }
+                break;
             }
         }
         else if(request == NULL || file == NULL)
@@ -260,10 +274,6 @@ void* connection(void * connectionInfo)
             {//http/1.1
                 if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
                 {}
-                else if(strcmp(connection,"connection:close")==0) //close socket
-                {
-                    break;
-                }
                 else
                 {
                     break;
@@ -296,10 +306,6 @@ void* connection(void * connectionInfo)
             {//http/1.1
                 if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
                 {}
-                else if(strcmp(connection,"connection:close")==0) //close socket
-                {
-                    break;
-                }
                 else
                 {
                     break;
@@ -327,10 +333,6 @@ void* connection(void * connectionInfo)
             {//http/1.1
                 if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
                 {}
-                else if(strcmp(connection,"connection:close")==0) //close socket
-                {
-                    break;
-                }
                 else
                 {
                     break;
@@ -352,6 +354,30 @@ void* connection(void * connectionInfo)
         }
         else
         {
+            char version1[9];
+            strcpy(version1,version);
+            if(strcmp(version1,"HTTP/1.1")==0)
+            {//http/1.1
+                if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
+                {}
+                else
+                {
+                    keepAlive = false;
+                }
+            }
+            else
+            {//http/1.0
+                if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
+                {
+                    keepAlive = false;
+                }
+                else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
+                {}
+                else
+                {
+                    keepAlive = false;
+                }
+            }
             long filesize =0;
             if(!strcmp(file,"/"))
             {
@@ -361,147 +387,39 @@ void* connection(void * connectionInfo)
                     fp = access("www/index.htm", F_OK) == 0 ? fopen("www/index.htm","rb") : fopen("www/index.html","rb"); //attempt to open
                     if(fp ==NULL)
                     {
-                        Forbidden(sockfd,version,connection); //no read access
-                        if(strcmp(version,"HTTP/1.1")==0)
-                        {//http/1.1
-                            if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
-                            {}
-                            else if(strcmp(connection,"connection:close")==0) //close socket
-                            {
-                                break;
-                            }
-                            else
-                            {
-                                break;
-                            }
+                        Forbidden(sockfd,version1,connection); //no read access
+                    }
+                    else
+                    {
+                        char * contentType = "text/html";
+                        fseek(fp, 0L, SEEK_END);
+                        filesize = ftell(fp);
+                        fseek(fp, 0L, SEEK_SET);
+                        char * fileContent = malloc(sizeof(char) * filesize);
+                        fread(fileContent,1,filesize,fp);
+                        char header[BUFSIZE];
+                        if(keepAlive)
+                        {
+                            snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:keep-alive\r\n\r\n",version1,contentType,filesize); //send keepalive
                         }
                         else
-                        {//http/1.0
-                            if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
-                            {
-                                break;
-                            }
-                            else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                            {}
-                            else
-                            {
-                                break;
-                            }
+                        {
+                            snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:close\r\n\r\n",version1,contentType,filesize); //send close
                         }
+                        char * fullResponse = malloc(sizeof(char) * (strlen(header) + filesize));
+                        strcpy(fullResponse, header);
+                        memcpy(fullResponse+strlen(header), fileContent, filesize);
+                        n = send(sockfd,fullResponse,strlen(header) + filesize,0);//all good so send full responce
+                        if (n < 0) 
+                            {free(fullResponse);free(fileContent);error("ERROR in sendto");}
+                        free(fullResponse);
+                        free(fileContent);
+                        fclose(fp);
                     }
                 }
                 else
                 {
                     NotFound(sockfd,version,connection); //neither file found
-                    if(strcmp(version,"HTTP/1.1")==0)
-                    {//http/1.1
-                        if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
-                        {}
-                        else if(strcmp(connection,"connection:close")==0) //close socket
-                        {
-                            break;
-                        }
-                        else
-                        {
-                            break;
-                        }
-                    }
-                    else
-                    {//http/1.0
-                        if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
-                        {
-                            break;
-                        }
-                        else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                        {}
-                        else
-                        {
-                            break;
-                        }
-                    }
-                }
-                
-                char * contentType = "text/html";
-                fseek(fp, 0L, SEEK_END);
-                filesize = ftell(fp);
-                fseek(fp, 0L, SEEK_SET);
-                //char fileContent[filesize];
-                char *fileContent = malloc(sizeof(char) * filesize);
-                fread(fileContent,1,filesize,fp);
-                char header[BUFSIZE];
-                if(strcmp(version,"HTTP/1.1")==0)
-                {//http/1.1
-                    if(connection==NULL || strcmp(connection,"connection:keep-alive")==0)
-                    {
-                        snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:keep-alive\r\n\r\n",version,contentType,filesize); //send keepalive
-                    }
-                    else if(strcmp(connection,"connection:close")==0)
-                    {
-                        snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:close\r\n\r\n",version,contentType,filesize); //send close
-                    }
-                    else
-                    {
-                        fclose(fp);
-                        free(fileContent);
-                        break;
-                    }
-                }
-                else
-                {//http/1.0
-                    if(connection==NULL || strcmp(connection,"connection:close")==0)
-                    {
-                        snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:close\r\n\r\n",version,contentType,filesize); //send close
-                    }
-                    else if(strcmp(connection,"connection:keep-alive")==0)
-                    {
-                        snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:keep-alive\r\n\r\n",version,contentType,filesize); //send keepalive
-                    }
-                    else
-                    {
-                        fclose(fp);
-                        free(fileContent);
-                        break;
-                    }
-                }
-                //char fullResponse[strlen(header)+filesize];
-                char* fullResponse = malloc(sizeof(char) * (strlen(header) + filesize));
-                strcpy(fullResponse, header);
-                memcpy(fullResponse+strlen(header), fileContent, filesize);
-                n = send(sockfd,fullResponse,strlen(header) + filesize,0);//all good so send full responce
-                if (n < 0) 
-                {
-                    free(fullResponse);
-                    free(fileContent);
-                    error("ERROR in sendto");
-                }
-                fclose(fp);
-                free(fullResponse);
-                free(fileContent);
-                if(strcmp(version,"HTTP/1.1")==0)
-                {//http/1.1
-                    if(connection==NULL || strcmp(connection,"connection:keep-alive")==0)//leave connection open
-                    {}
-                    else if(strcmp(connection,"connection:close")==0)
-                    {
-                        break; //break loop and close socket
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
-                else
-                {//http/1.0
-                    if(connection==NULL || strcmp(connection,"connection:close")==0)
-                    {
-                        break; //close socket
-                    }
-                    else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                    {}
-                    else
-                    {
-                        break;
-                    }
                 }
             }
             else
@@ -517,33 +435,7 @@ void* connection(void * connectionInfo)
                         char* extentionDot = strrchr(file, '.');
                         if(extentionDot==NULL)
                         {
-                            BadRequest(sockfd,version,connection); //attempted file has no extention
-                            if(strcmp(version,"HTTP/1.1")==0)
-                            {//http/1.1
-                                if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
-                                {}
-                                else if(strcmp(connection,"connection:close")==0) //close socket
-                                {
-                                    break;
-                                }
-                                else
-                                {
-                                    break;
-                                }
-                            }
-                            else
-                            {//http/1.0
-                                if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
-                                {
-                                    break;
-                                }
-                                else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                                {}
-                                else
-                                {
-                                    break;
-                                }
-                            }
+                            BadRequest(sockfd,version1,connection); //attempted file has no extention
                         }
                         else
                         {
@@ -560,34 +452,8 @@ void* connection(void * connectionInfo)
                             else if (strcmp(extention,"js")==0)strcpy(contentType,"application/javascript");
                             else
                             {
-                                BadRequest(sockfd,version,connection); //unsupported contentType
+                                BadRequest(sockfd,version1,connection); //unsupported contentType
                                 fclose(fp);//close file
-                                if(strcmp(version,"HTTP/1.1")==0)
-                                {//http/1.1
-                                    if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
-                                    {}
-                                    else if(strcmp(connection,"connection:close")==0) //close socket
-                                    {
-                                        break;
-                                    }
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
-                                else
-                                {//http/1.0
-                                    if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
-                                    {
-                                        break;
-                                    }
-                                    else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                                    {}
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
                             }
                             if(fp!=NULL)
                             {//valid file shiet
@@ -597,147 +463,39 @@ void* connection(void * connectionInfo)
                                 char* fileContent = malloc(sizeof(char) * filesize);
                                 fread(fileContent,1,filesize,fp);
                                 char header[BUFSIZE];
-                                if(strcmp(version,"HTTP/1.1")==0)
-                                {//http/1.1
-                                    if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //send keep alive
-                                    {
-                                        snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:keep-alive\r\n\r\n",version,contentType,filesize);
-                                    }
-                                    else if(strcmp(connection,"connection:close")==0) //send close
-                                    {
-                                        snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:close\r\n\r\n",version,contentType,filesize);
-                                    }
-                                    else
-                                    {
-                                        fclose(fp);
-                                        free(fileContent);
-                                        break;
-                                    }
+                                if(keepAlive)
+                                {
+                                    snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:keep-alive\r\n\r\n",version1,contentType,filesize); //send keepalive
                                 }
                                 else
-                                {//http/1.0
-                                    if(connection==NULL || strcmp(connection,"connection:close")==0) //send close
-                                    {
-                                        snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:close\r\n\r\n",version,contentType,filesize);
-                                    }
-                                    else if(strcmp(connection,"connection:keep-alive")==0) //send keepalive
-                                    {
-                                        snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:keep-alive\r\n\r\n",version,contentType,filesize);
-                                    }
-                                    else
-                                    {
-                                        fclose(fp);
-                                        free(fileContent);
-                                        break;
-                                    }
+                                {
+                                    snprintf(header,sizeof(header), "%s 200 OK\r\nContent-Type:%s\nContent-Length:%ld\r\nConnection:close\r\n\r\n",version1,contentType,filesize); //send close
                                 }
-                                //char fullResponse[strlen(header)+filesize];
-                                char* fullResponse = malloc(sizeof(char) * (strlen(header)+filesize));
+                                char* fullResponse = malloc(sizeof(char) * (strlen(header) + filesize));
                                 strcpy(fullResponse, header);
                                 memcpy(fullResponse+strlen(header), fileContent, filesize);
                                 n = send(sockfd,fullResponse,strlen(header) + filesize,0); //send full response
                                 if (n < 0) 
-                                {
-                                    free(fullResponse);
-                                    free(fileContent);
-                                    error("ERROR in sendto");
-                                }
-                                fclose(fp);
+                                    {free(fullResponse);free(fileContent);error("ERROR in sendto");}
                                 free(fullResponse);
                                 free(fileContent);
-                                if(strcmp(version,"HTTP/1.1")==0)
-                                {//http/1.1
-                                    if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
-                                    {}
-                                    else if(strcmp(connection,"connection:close")==0) //close socket
-                                    {
-                                        break;
-                                    }
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
-                                else
-                                {//http/1.0
-                                    if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
-                                    {
-                                        break;
-                                    }
-                                    else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                                    {}
-                                    else
-                                    {
-                                        break;
-                                    }
-                                }
+                                fclose(fp);
                             }
                         }
                     }
                     else
                     {
-                        Forbidden(sockfd,version,connection); //no read permissions
-                        if(strcmp(version,"HTTP/1.1")==0)
-                        {//http/1.1
-                            if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
-                            {}
-                            else if(strcmp(connection,"connection:close")==0) //close socket
-                            {
-                                break;
-                            }
-                            else
-                            {
-                                break;
-                            }
-                        }
-                        else
-                        {//http/1.0
-                            if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
-                            {
-                                break;
-                            }
-                            else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                            {}
-                            else
-                            {
-                                break;
-                            }
-                        }
+                        Forbidden(sockfd,version1,connection); //no read permission
                     }
                 }
                 else
                 {
-                    NotFound(sockfd,version,connection); //file not found
-                    if(strcmp(version,"HTTP/1.1")==0)
-                    {//http/1.1
-                        if(connection==NULL || strcmp(connection,"connection:keep-alive")==0) //keep socket alive
-                        {}
-                        else if(strcmp(connection,"connection:close")==0) //close socket
-                        {
-                            break;
-                        }
-                        else
-                        {
-                            break;
-                        }
-                    }
-                    else
-                    {//http/1.0
-                        if(connection==NULL || strcmp(connection,"connection:close")==0) //close socket
-                        {
-                            break;
-                        }
-                        else if(strcmp(connection,"connection:keep-alive")==0) //keep socket open
-                        {}
-                        else
-                        {
-                            break;
-                        }
-                    }
+                    NotFound(sockfd,version1,connection); //file not found
                 }
             }
         }
         bzero(buf, BUFSIZE); // reset buffer JUUUUUSSSSST incase
+        if(!keepRunning|| !keepAlive) break;
     }
     bzero(buf, BUFSIZE);
     close(sockfd); //close socket
@@ -784,6 +542,8 @@ int main(int argc, char **argv)
         error("ERROR on listening");
     clientlen = sizeof(clientaddr);
     int connectedfd;
+    Vector threadVec;
+    initArray(&threadVec,10);
     while((connectedfd = accept(MAINsockfd,(struct sockaddr *) &clientaddr, (socklen_t *) &clientlen))>0)
     {
         int *clientSocket = malloc(sizeof(int));
@@ -791,8 +551,14 @@ int main(int argc, char **argv)
         pthread_t tid;
         if(pthread_create(&tid, NULL, connection,(void *)clientSocket) < 0)
             error("Error on pthread create");
+        insertArray(&threadVec,tid);
     }
-    sleep(10);
+    //sleep(10);
+    for(unsigned long i=0;i<threadVec.used;i++)
+    {
+        pthread_join(threadVec.array[i],NULL);
+    }
+    freeArray(&threadVec);
     printf("Goodbye!\n");
     exit(0);
 }
